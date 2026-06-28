@@ -1,0 +1,246 @@
+GUIA TECNICA DETALLADA: RAG CON LANGCHAIN, SUPABASE, FLASK Y FRONTEND JS
+
+A continuación, se presenta la arquitectura completa, dividida en bloques. Cada bloque de código está seguido de una explicación técnica directa sobre su función y los conceptos teóricos involucrados.
+
+
+---------------------------------------------------------
+BLOQUE 1: CONFIGURACION DE SUPABASE (SQL)
+---------------------------------------------------------
+
+create extension if not exists vector;
+
+create table documents (
+  id bigserial primary key,
+  content text,
+  metadata jsonb,
+  embedding vector(1536)
+);
+
+create function match_documents (
+  query_embedding vector(1536),
+  match_count int DEFAULT null,
+  filter jsonb DEFAULT '{}'
+) returns table (
+  id bigint,
+  content text,
+  metadata jsonb,
+  similarity float
+)
+language plpgsql
+as $$
+#variable_conflict use_column
+begin
+  return query
+  select
+    id,
+    content,
+    metadata,
+    1 - (documents.embedding <=> query_embedding) as similarity
+  from documents
+  where metadata @> filter
+  order by documents.embedding <=> query_embedding
+  limit match_count;
+end;
+$$;
+
+--- EXPLICACIÓN DEL BLOQUE 1 ---
+
+Conceptos Clave:
+* pgvector: Es una extensión de PostgreSQL (la base de datos detrás de Supabase) que le permite almacenar y buscar "vectores".
+* Vector / Embedding: Es una representación matemática de un texto. Un modelo de IA toma una oración y la convierte en una lista de 1536 números. Textos con significados similares (ej. "falla en el motor" y "problema de arranque") tendrán vectores matemáticamente cercanos.
+* Metadatos (JSONB): Permite guardar información extra filtrable. Si almacenas manuales técnicos de motocicletas para diagnóstico de fallas, el "content" es el texto del manual, y el "metadata" puede ser {"marca": "Yamaha", "modelo": "MT-09", "año": 2023}.
+
+Qué hace el código:
+1. Habilita la capacidad vectorial en la base de datos.
+2. Crea la tabla `documents` para guardar el texto original, los metadatos y su representación en números (embedding).
+3. Crea un RPC (Remote Procedure Call) llamado `match_documents`. Esta es una función que toma la pregunta del usuario (convertida a vector) y usa el operador `<=>` (que calcula la distancia del coseno) para encontrar los fragmentos de texto almacenados que más se parecen a la pregunta, devolviéndolos ordenados por similitud.
+
+
+---------------------------------------------------------
+BLOQUE 2: INGESTA Y RECUPERACIÓN (PYTHON / LANGCHAIN)
+---------------------------------------------------------
+
+import os
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import SupabaseVectorStore
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from supabase.client import Client, create_client
+
+supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+def ingestar_documentos(ruta_archivo):
+    loader = TextLoader(ruta_archivo)
+    docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    fragmentos = text_splitter.split_documents(docs)
+    
+    SupabaseVectorStore.from_documents(
+        fragmentos,
+        embeddings,
+        client=supabase,
+        table_name="documents",
+        query_name="match_documents"
+    )
+    print("Ingesta completada.")
+
+def configurar_cadena_rag():
+    vector_store = SupabaseVectorStore(
+        client=supabase, 
+        embedding=embeddings, 
+        table_name="documents", 
+        query_name="match_documents"
+    )
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    
+    system_prompt = (
+        "Eres un asistente tecnico experto. Usa los siguientes fragmentos de "
+        "contexto para responder a la pregunta. Si no sabes la respuesta, di "
+        "que no la sabes.\n\nContexto:\n{context}"
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ])
+    
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    return create_retrieval_chain(retriever, question_answer_chain)
+
+rag_chain = configurar_cadena_rag()
+
+--- EXPLICACIÓN DEL BLOQUE 2 ---
+
+Conceptos Clave:
+* Chunking (Fragmentación): Los LLMs tienen un límite de contexto (cuántas palabras pueden procesar a la vez). No puedes pasarle un manual entero. `RecursiveCharacterTextSplitter` corta el documento en "chunks" de 1000 caracteres, dejando un solapamiento (overlap) de 100 caracteres entre cada uno para no perder el contexto si el corte cae a mitad de una idea.
+* Retriever: Es el componente de LangChain encargado de buscar la información. Al configurarlo con `search_kwargs={"k": 3}`, le indicamos que traiga los 3 fragmentos más relevantes de la base de datos.
+* Stuff Documents Chain: Es una técnica donde LangChain toma los fragmentos recuperados (los 3 chunks) y los "empaqueta" (stuff) directamente en la variable `{context}` del prompt del sistema.
+
+Qué hace el código:
+1. `ingestar_documentos`: Lee el archivo txt, lo corta en fragmentos, usa OpenAI para convertir cada fragmento en vectores y los envía a tu tabla de Supabase mediante el cliente.
+2. `configurar_cadena_rag`: Conecta Supabase en modo "lectura". Configura el prompt indicando al modelo que actúe como un asistente técnico y que solo use el contexto proporcionado. Finalmente, une el buscador (retriever) con el modelo de lenguaje (LLM) en una sola cadena lista para recibir preguntas.
+
+
+---------------------------------------------------------
+BLOQUE 3: CREACION DE LA API REST (FLASK)
+---------------------------------------------------------
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from motor_rag import rag_chain
+
+app = Flask(__name__)
+CORS(app)
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.json
+    pregunta = data.get("pregunta")
+
+    if not pregunta:
+        return jsonify({"error": "La pregunta es obligatoria"}), 400
+
+    try:
+        resultado = rag_chain.invoke({"input": pregunta})
+        return jsonify({"respuesta": resultado["answer"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(port=5000, debug=True)
+
+--- EXPLICACIÓN DEL BLOQUE 3 ---
+
+Conceptos Clave:
+* API REST: Una interfaz que permite que dos sistemas de software se comuniquen. En este caso, actúa como un puente entre tu lógica de Python/LangChain (Backend) y tu interfaz de usuario web (Frontend).
+* Endpoint: Es la URL (`/api/chat`) a la que el frontend enviará las peticiones.
+* Métodos HTTP (POST): Usamos POST porque el cliente está enviando datos al servidor (la pregunta del usuario) en el cuerpo de la petición.
+* CORS (Cross-Origin Resource Sharing): Medida de seguridad en los navegadores. Si tu frontend está en el puerto 3000 y el backend en el puerto 5000, el navegador bloqueará la conexión por defecto. `CORS(app)` desactiva este bloqueo.
+* JSON: El formato estándar para intercambiar datos estructurados.
+
+Qué hace el código:
+Inicializa un servidor local en el puerto 5000. Queda a la espera de recibir peticiones POST en la ruta `/api/chat`. Cuando recibe una, extrae la variable "pregunta", ejecuta la cadena `rag_chain` importada del bloque 2, y devuelve la respuesta generada por el LLM en formato JSON para que el frontend la consuma.
+
+
+---------------------------------------------------------
+BLOQUE 4: INTERFAZ DE USUARIO FRONTEND (HTML + VANILLA JS)
+---------------------------------------------------------
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatbot RAG</title>
+    <style>
+        body { font-family: system-ui; background: #1e1e1e; color: #fff; margin: 0; padding: 20px; display: flex; justify-content: center; }
+        .chat-container { width: 100%; max-width: 600px; background: #2d2d2d; border-radius: 8px; padding: 20px; }
+        .messages { height: 400px; overflow-y: auto; margin-bottom: 20px; display: flex; flex-direction: column; gap: 10px; }
+        .message { padding: 10px 15px; border-radius: 6px; max-width: 80%; }
+        .user { background: #007aff; align-self: flex-end; }
+        .bot { background: #444; align-self: flex-start; }
+        .input-group { display: flex; gap: 10px; }
+        input { flex: 1; padding: 12px; border: none; border-radius: 4px; background: #444; color: white; outline: none; }
+        button { padding: 12px 20px; border: none; border-radius: 4px; background: #28a745; color: white; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<div class="chat-container">
+    <div class="messages" id="chat-window"></div>
+    <div class="input-group">
+        <input type="text" id="user-input" placeholder="Pregunta algo..." autocomplete="off">
+        <button onclick="enviarMensaje()">Enviar</button>
+    </div>
+</div>
+
+<script>
+    const chatWindow = document.getElementById('chat-window');
+    const userInput = document.getElementById('user-input');
+
+    userInput.addEventListener("keypress", e => { if (e.key === "Enter") enviarMensaje(); });
+
+    function agregarMensaje(texto, clase) {
+        const div = document.createElement('div');
+        div.className = `message ${clase}`;
+        div.textContent = texto;
+        chatWindow.appendChild(div);
+        chatWindow.scrollTop = chatWindow.scrollHeight;
+    }
+
+    async function enviarMensaje() {
+        const pregunta = userInput.value.trim();
+        if (!pregunta) return;
+
+        agregarMensaje(pregunta, 'user');
+        userInput.value = '';
+
+        try {
+            const respuesta = await fetch('http://localhost:5000/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pregunta })
+            });
+            const data = await respuesta.json();
+            agregarMensaje(data.respuesta || ("Error: " + data.error), 'bot');
+        } catch (err) {
+            agregarMensaje("Error de conexion al backend.", 'bot');
+        }
+    }
+</script>
+</body>
+</html>
+
+--- EXPLICACIÓN DEL BLOQUE 4 ---
+
+Conceptos Clave:
+* DOM (Document Object Model): Es la estructura de la página. El script usa JavaScript para manipular el DOM dinámicamente, creando nuevos `<div>` cada vez que hay un mensaje sin necesidad de recargar la página.
+* Programación Asíncrona (`async / await`): Las consultas a la IA tardan tiempo (segundos). En lugar de congelar toda la interfaz web, `await fetch(...)` le dice a JavaScript que espere la respuesta en segundo plano, permitiendo que el navegador siga funcionando.
+* API Fetch: Es la función nativa de JavaScript moderno para hacer peticiones HTTP (para hablar con tu servidor Flask). No requiere librerías externas.
+
+Qué hace el código:
+Define la estructura visual y los estilos CSS básicos. En la lógica de JavaScript, captura el texto ingresado por el usuario, lo pinta en la pantalla alineado a la derecha, limpia el input y envía la pregunta empaquetada en un JSON hacia el puerto 5000. Una vez que recibe la respuesta del servidor Python, extrae el texto y pinta un nuevo bloque alineado a la izquierda simulando el comportamiento típico de un chat.
